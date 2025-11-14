@@ -24,7 +24,7 @@ import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Sequence
+from typing import Callable, Iterable, List, Sequence, Set
 
 
 # ------------------------------ Data models ------------------------------
@@ -182,28 +182,110 @@ def build_service_profiles() -> List[ServiceProfile]:
                 ("MySQL info", _cmd("nmap", "--script", "mysql-info", "-p", "{port}", "{host}")),
             ],
         ),
+        ServiceProfile(
+            name="dns",
+            matcher=lambda s: s.service in {"domain", "dns"} or s.port == 53,
+            commands=[
+                (
+                    "Nmap DNS bruteforce",
+                    _cmd("nmap", "-sU", "-p", "{port}", "--script", "dns-brute,dns-recursion", "{host}"),
+                ),
+                ("Consulta version.bind", _cmd("dig", "@{host}", "version.bind", "chaos", "txt")),
+            ],
+        ),
+        ServiceProfile(
+            name="smtp",
+            matcher=lambda s: s.service in {"smtp", "submission"} or s.port in {25, 587},
+            commands=[
+                (
+                    "SMTP enum usuarios",
+                    _cmd("smtp-user-enum", "-M", "VRFY", "-U", "/usr/share/wordlists/smtp_users.txt", "-t", "{host}"),
+                ),
+                (
+                    "SMTP nmap scripts",
+                    _cmd("nmap", "--script", "smtp-enum-users,smtp-commands", "-p", "{port}", "{host}"),
+                ),
+            ],
+        ),
+        ServiceProfile(
+            name="pop3-imap",
+            matcher=lambda s: s.service in {"pop3", "pop3s", "imap", "imaps"} or s.port in {110, 995, 143, 993},
+            commands=[
+                (
+                    "POP3/IMAP capabilities",
+                    _cmd("nmap", "--script", "pop3-capabilities,imap-capabilities", "-p", "{port}", "{host}"),
+                ),
+            ],
+        ),
+        ServiceProfile(
+            name="snmp",
+            matcher=lambda s: s.service == "snmp" or s.port in {161, 162},
+            commands=[
+                ("SNMP walk comunitaria pública", _cmd("snmpwalk", "-v2c", "-c", "public", "{host}", "1.3.6.1.2.1.1")),
+                (
+                    "SNMP nmap", _cmd("nmap", "-sU", "-p", "{port}", "--script", "snmp-info,snmp-brute", "{host}"),
+                ),
+            ],
+        ),
+        ServiceProfile(
+            name="winrm",
+            matcher=lambda s: s.service in {"winrm"} or s.port in {5985, 5986},
+            commands=[
+                (
+                    "WinRM identificación",
+                    _cmd("crackmapexec", "winrm", "{host}", "-u", "administrator", "-p", "''"),
+                ),
+            ],
+        ),
     ]
 
 
-def plan_commands(hosts: Iterable[Host]) -> List[PlannedCommand]:
+def _normalize_filter_values(values: Sequence[str] | None) -> Set[str] | None:
+    if not values:
+        return None
+    tokens: Set[str] = set()
+    for value in values:
+        for token in value.split(","):
+            token = token.strip()
+            if token:
+                tokens.add(token)
+    return tokens or None
+
+
+def plan_commands(
+    hosts: Iterable[Host],
+    *,
+    include_services: Set[str] | None = None,
+    exclude_services: Set[str] | None = None,
+) -> List[PlannedCommand]:
     profiles = build_service_profiles()
     commands: List[PlannedCommand] = []
 
+    def service_allowed(name: str) -> bool:
+        if include_services and name not in include_services:
+            return False
+        if exclude_services and name in exclude_services:
+            return False
+        return True
+
     for host in hosts:
         host_ports = ",".join(str(s.port) for s in host.services)
-        commands.append(
-            PlannedCommand(
-                host_ip=host.ip,
-                service="multipuerto",
-                port=None,
-                description="Nmap detallado de todos los puertos abiertos",
-                command=["nmap", "-sC", "-sV", "-p", host_ports, host.ip],
+        if service_allowed("multipuerto"):
+            commands.append(
+                PlannedCommand(
+                    host_ip=host.ip,
+                    service="multipuerto",
+                    port=None,
+                    description="Nmap detallado de todos los puertos abiertos",
+                    command=["nmap", "-sC", "-sV", "-p", host_ports, host.ip],
+                )
             )
-        )
 
         for service in host.services:
             for profile in profiles:
                 if profile.matcher(service):
+                    if not service_allowed(profile.name):
+                        continue
                     for description, template in profile.commands:
                         commands.append(
                             PlannedCommand(
@@ -330,6 +412,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="reports", help="Directorio donde se guardarán los resultados")
     parser.add_argument("--max-workers", type=int, default=4, help="Número máximo de comandos simultáneos")
     parser.add_argument("--dry-run", action="store_true", help="Solo mostrar los comandos que se ejecutarían")
+    parser.add_argument(
+        "--only-hosts",
+        nargs="*",
+        help="Filtra los hosts a incluir (IPs u hostnames separados por espacios o comas)",
+    )
+    parser.add_argument(
+        "--skip-hosts",
+        nargs="*",
+        help="Hosts a omitir (IPs u hostnames separados por espacios o comas)",
+    )
+    parser.add_argument(
+        "--only-services",
+        nargs="*",
+        help="Ejecuta únicamente los perfiles indicados (por ejemplo: http smb multipuerto)",
+    )
+    parser.add_argument(
+        "--skip-services",
+        nargs="*",
+        help="Perfiles a omitir por nombre (por ejemplo: http smb multipuerto)",
+    )
     return parser
 
 
@@ -345,7 +447,21 @@ def main() -> None:
     if not hosts:
         raise SystemExit("No se encontraron hosts activos en el XML proporcionado")
 
-    commands = plan_commands(hosts)
+    include_hosts = _normalize_filter_values(args.only_hosts)
+    exclude_hosts = _normalize_filter_values(args.skip_hosts)
+
+    if include_hosts:
+        hosts = [host for host in hosts if host.ip in include_hosts or (host.hostname and host.hostname in include_hosts)]
+    if exclude_hosts:
+        hosts = [host for host in hosts if host.ip not in exclude_hosts and (not host.hostname or host.hostname not in exclude_hosts)]
+
+    if not hosts:
+        raise SystemExit("Los filtros aplicados eliminaron todos los hosts del XML")
+
+    include_services = _normalize_filter_values(args.only_services)
+    exclude_services = _normalize_filter_values(args.skip_services)
+
+    commands = plan_commands(hosts, include_services=include_services, exclude_services=exclude_services)
     output_dir = Path(args.output)
     prepare_log_paths(commands, output_dir)
     execute_commands(commands, args.dry_run, args.max_workers)
