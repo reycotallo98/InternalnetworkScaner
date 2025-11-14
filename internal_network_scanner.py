@@ -46,7 +46,23 @@ class Host:
     services: List[Service]
 
 
-CommandTemplate = Sequence[str]
+@dataclass(slots=True)
+class ADCredentials:
+    username: str | None = None
+    password: str | None = None
+    domain: str | None = None
+
+
+@dataclass(slots=True)
+class OptionalArgument:
+    """Argumento que solo se incluye si la clave indicada tiene valor."""
+
+    key: str
+    parts: Sequence[str]
+
+
+CommandElement = str | OptionalArgument
+CommandTemplate = Sequence[CommandElement]
 
 
 @dataclass(slots=True)
@@ -123,8 +139,28 @@ def parse_nmap_xml(xml_path: Path) -> List[Host]:
 # ------------------------------ Command planning ------------------------------
 
 
-def _cmd(*args: str) -> CommandTemplate:
+def optional_arg(key: str, *parts: str) -> OptionalArgument:
+    return OptionalArgument(key=key, parts=list(parts))
+
+
+def _cmd(*args: CommandElement) -> CommandTemplate:
     return list(args)
+
+
+def _format_command(
+    template: CommandTemplate,
+    context: dict[str, str],
+    provided_flags: dict[str, bool],
+) -> List[str]:
+    command: List[str] = []
+    for element in template:
+        if isinstance(element, OptionalArgument):
+            if provided_flags.get(element.key):
+                for part in element.parts:
+                    command.append(part.format(**context))
+        else:
+            command.append(element.format(**context))
+    return command
 
 
 def build_service_profiles() -> List[ServiceProfile]:
@@ -143,7 +179,17 @@ def build_service_profiles() -> List[ServiceProfile]:
             matcher=lambda s: s.service in {"microsoft-ds", "netbios-ssn", "smb"} or s.port in {139, 445},
             commands=[
                 ("Enum4linux", _cmd("enum4linux", "-a", "{host}")),
-                ("SMBMap", _cmd("smbmap", "-H", "{host}")),
+                (
+                    "SMBMap",
+                    _cmd(
+                        "smbmap",
+                        "-H",
+                        "{host}",
+                        optional_arg("ad_user", "-u", "{ad_user}"),
+                        optional_arg("ad_password", "-p", "{ad_password}"),
+                        optional_arg("ad_domain", "-d", "{ad_domain}"),
+                    ),
+                ),
                 (
                     "Nmap scripts SMB",
                     _cmd("nmap", "--script", "smb-enum-shares,smb-enum-users", "-p", "{port}", "{host}"),
@@ -238,7 +284,14 @@ def build_service_profiles() -> List[ServiceProfile]:
             commands=[
                 (
                     "WinRM identificación",
-                    _cmd("crackmapexec", "winrm", "{host}", "-u", "administrator", "-p", "''"),
+                    _cmd(
+                        "crackmapexec",
+                        "winrm",
+                        "{host}",
+                        optional_arg("ad_user", "-u", "{ad_user}"),
+                        optional_arg("ad_password", "-p", "{ad_password}"),
+                        optional_arg("ad_domain", "-d", "{ad_domain}"),
+                    ),
                 ),
             ],
         ),
@@ -262,9 +315,21 @@ def plan_commands(
     *,
     include_services: Set[str] | None = None,
     exclude_services: Set[str] | None = None,
+    credentials: ADCredentials | None = None,
 ) -> List[PlannedCommand]:
     profiles = build_service_profiles()
     commands: List[PlannedCommand] = []
+    creds = credentials or ADCredentials()
+    credential_values = {
+        "ad_user": creds.username or "",
+        "ad_password": creds.password or "",
+        "ad_domain": creds.domain or "",
+    }
+    credential_presence = {
+        "ad_user": creds.username is not None,
+        "ad_password": creds.password is not None,
+        "ad_domain": creds.domain is not None,
+    }
 
     def service_allowed(name: str) -> bool:
         if include_services and name not in include_services:
@@ -292,13 +357,18 @@ def plan_commands(
                     if not service_allowed(profile.name):
                         continue
                     for description, template in profile.commands:
+                        format_context = {
+                            "host": service.host_ip,
+                            "port": str(service.port),
+                            **credential_values,
+                        }
                         commands.append(
                             PlannedCommand(
                                 host_ip=service.host_ip,
                                 service=profile.name,
                                 port=service.port,
                                 description=description,
-                                command=[arg.format(host=service.host_ip, port=service.port) for arg in template],
+                                command=_format_command(template, format_context, credential_presence),
                             )
                         )
 
@@ -349,15 +419,20 @@ def run_command(cmd: PlannedCommand, dry_run: bool = False) -> None:
 
 
 def execute_commands(commands: Iterable[PlannedCommand], dry_run: bool, max_workers: int) -> None:
+    commands_by_host: dict[str, List[PlannedCommand]] = {}
+    for command in commands:
+        commands_by_host.setdefault(command.host_ip, []).append(command)
+
     semaphore = threading.Semaphore(max_workers)
 
-    def worker(cmd: PlannedCommand) -> None:
+    def host_worker(host_ip: str, host_commands: List[PlannedCommand]) -> None:
         with semaphore:
-            run_command(cmd, dry_run=dry_run)
+            for cmd in host_commands:
+                run_command(cmd, dry_run=dry_run)
 
     threads: List[threading.Thread] = []
-    for command in commands:
-        thread = threading.Thread(target=worker, args=(command,), daemon=True)
+    for host_ip, host_commands in commands_by_host.items():
+        thread = threading.Thread(target=host_worker, args=(host_ip, host_commands), daemon=True)
         thread.start()
         threads.append(thread)
 
@@ -415,7 +490,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Automatiza enumeraciones tras un escaneo Nmap -oA")
     parser.add_argument("--nmap-base", required=True, help="Ruta base utilizada al ejecutar 'nmap -oA'")
     parser.add_argument("--output", default="reports", help="Directorio donde se guardarán los resultados")
-    parser.add_argument("--max-workers", type=int, default=4, help="Número máximo de comandos simultáneos")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Número máximo de hosts procesados en paralelo",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Solo mostrar los comandos que se ejecutarían")
     parser.add_argument(
         "--only-hosts",
@@ -437,6 +517,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Perfiles a omitir por nombre (por ejemplo: http smb multipuerto)",
     )
+    parser.add_argument("--ad-user", help="Usuario de Active Directory para reutilizar en los comandos soportados")
+    parser.add_argument("--ad-password", help="Contraseña del usuario de Active Directory")
+    parser.add_argument("--ad-domain", help="Dominio de Active Directory asociado a las credenciales")
     return parser
 
 
@@ -466,7 +549,13 @@ def main() -> None:
     include_services = _normalize_filter_values(args.only_services)
     exclude_services = _normalize_filter_values(args.skip_services)
 
-    commands = plan_commands(hosts, include_services=include_services, exclude_services=exclude_services)
+    credentials = ADCredentials(username=args.ad_user, password=args.ad_password, domain=args.ad_domain)
+    commands = plan_commands(
+        hosts,
+        include_services=include_services,
+        exclude_services=exclude_services,
+        credentials=credentials,
+    )
     output_dir = Path(args.output)
     prepare_log_paths(commands, output_dir)
     execute_commands(commands, args.dry_run, args.max_workers)

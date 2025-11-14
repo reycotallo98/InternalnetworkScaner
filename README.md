@@ -25,8 +25,9 @@ Escaner de red interna automatizado, que a partir de un archivo generado con nma
 ### Opciones adicionales
 
 - `--output`: carpeta donde guardar los reportes (por defecto `reports`).
-- `--max-workers`: número de comandos simultáneos para acelerar la ejecución.
+- `--max-workers`: número de hosts procesados en paralelo (cada host se maneja en su propio hilo).
 - `--dry-run`: imprime los comandos planeados sin ejecutarlos, útil para ajustar la lista antes de lanzar la enumeración completa.
 - `--only-hosts` / `--skip-hosts`: limita el escaneo a IPs/hostnames concretos o descarta objetivos ya revisados.
 - `--only-services` / `--skip-services`: permite orquestar únicamente ciertos perfiles (por ejemplo solo `smb` y `dns`) u omitir los que no interesen.
+- `--ad-user`, `--ad-password`, `--ad-domain`: credenciales de Active Directory que se reutilizan automáticamente en comandos que las soportan (por ejemplo `smbmap` o `crackmapexec winrm`).
 - Los archivos `summary.md` y `commands.csv` dentro del directorio de salida sirven como un panel de control del escaneo: el primero muestra tablas Markdown con los hosts y comandos ejecutados, mientras que el segundo facilita importar los resultados a una hoja de cálculo.
