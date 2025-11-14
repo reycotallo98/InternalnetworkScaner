@@ -92,12 +92,17 @@ def parse_nmap_xml(xml_path: Path) -> List[Host]:
         services: List[Service] = []
         for port in host.findall("ports/port"):
             state = port.find("state")
-            if not state or state.attrib.get("state") != "open":
+            state_value = state.attrib.get("state", "").lower() if state is not None else ""
+            if not state_value.startswith("open"):
                 continue
 
             service_el = port.find("service")
-            service_name = service_el.attrib.get("name", "unknown") if service_el else "unknown"
-            product = service_el.attrib.get("product") if service_el else None
+            if service_el is not None:
+                service_name = service_el.attrib.get("name", "unknown")
+                product = service_el.attrib.get("product")
+            else:
+                service_name = "unknown"
+                product = None
 
             services.append(
                 Service(
